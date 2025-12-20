@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.evaluator import evaluate_model
+from src.evaluators import evaluate_model
 
 # Import Models
 from experiments.baseline_transformer.model import BaselineTransformer
-from experiments.deep_thinking_2d.model import SudokuDeepThinking2D
-from experiments.feedforward_2d.model import SudokuFeedForward2D
+from experiments.deep_thinking.model import SudokuDeepThinking2D
+from experiments.feed_forward_neural_net.model import SudokuFeedForward2D
 from experiments.trm.model import TinyRecursiveReasoningModel_ACTV1
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
