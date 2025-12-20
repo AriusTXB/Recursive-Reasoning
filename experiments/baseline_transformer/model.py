@@ -1,94 +1,37 @@
-import sys
-import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import math
 
-# Add root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=81):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
 
-from src.dataset import SudokuDataset
-from src.visualizer import plot_convergence
-from src.evaluators import evaluate_model
-from model import BaselineTransformer
+    def forward(self, x):
+        return x + self.pe
 
-# Config
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE = 64
-EPOCHS = 20
-LR = 0.001
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def train():
-    print(f"--- Training Baseline Transformer on {DEVICE} ---")
-    
-    # Load Data
-    train_dataset = SudokuDataset("data/processed", split="train")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-    
-    # Init Model
-    model = BaselineTransformer(vocab_size=11, d_model=128, nhead=4, num_layers=4).to(DEVICE)
-    
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
-    
-    loss_history = []
-    best_puzzle_acc = 0.0
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
+class BaselineTransformer(nn.Module):
+    def __init__(self, vocab_size=11, d_model=128, nhead=4, num_layers=4):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
         
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        for inputs, labels in loop:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            
-            # Forward
-            logits = model(inputs) # [Batch, 81, 11]
-            
-            # Reshape for loss: [Batch*81, 11] vs [Batch*81]
-            loss = criterion(logits.view(-1, 11), labels.view(-1))
-            
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
-            
-        avg_loss = total_loss / len(train_loader)
-        loss_history.append(avg_loss)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=256, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # --- EVALUATION & SAVING ---
-        # Evaluate on Test Set
-        val_cell_acc, val_puzzle_acc = evaluate_model(model, DEVICE, split="test", model_type="standard")
-        
-        print(f"Epoch {epoch+1} Summary:")
-        print(f"  Train Loss: {avg_loss:.4f}")
-        print(f"  Test Puzzle Acc: {val_puzzle_acc:.2f}% (Cell Acc: {val_cell_acc:.2f}%)")
-        
-        # Save Latest
-        torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
-        
-        # Save Best
-        if val_puzzle_acc > best_puzzle_acc:
-            best_puzzle_acc = val_puzzle_acc
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
-            print(f"  >>> New Best Model Saved! <<<")
+        # Output logic: for each of the 81 cells, predict the digit (1-9)
+        # Output vocab size is same as input usually, but we really only care about digits 1-9 (indices 2-10)
+        self.fc_out = nn.Linear(d_model, vocab_size)
 
-        # Save Metrics Log
-        with open(os.path.join(OUTPUT_DIR, "metrics.csv"), "a") as f:
-            if epoch == 0:
-                f.write("Epoch,Loss,CellAcc,PuzzleAcc\n")
-            f.write(f"{epoch+1},{avg_loss},{val_cell_acc},{val_puzzle_acc}\n")
-
-    # Plot Convergence
-    plot_convergence(loss_history, os.path.join(OUTPUT_DIR, "convergence.png"))
-    print(f"Training Complete. Best Accuracy: {best_puzzle_acc:.2f}%")
-
-if __name__ == "__main__":
-    train()
+    def forward(self, x):
+        # x shape: [batch, 81]
+        x = self.embedding(x) # [batch, 81, d_model]
+        x = self.pos_encoder(x)
+        out = self.transformer_encoder(x)
+        logits = self.fc_out(out) # [batch, 81, vocab_size]
+        return logits

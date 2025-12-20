@@ -11,29 +11,32 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 
 from src.dataset import SudokuDataset
 from src.visualizer import plot_convergence
+from src.evaluators import evaluate_model
 from model import BaselineTransformer
 
 # Config
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 64
-EPOCHS = 10
+EPOCHS = 20
 LR = 0.001
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def train():
-    print(f"Training on {DEVICE}")
+    print(f"--- Training Baseline Transformer on {DEVICE} ---")
     
     # Load Data
     train_dataset = SudokuDataset("data/processed", split="train")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     
     # Init Model
-    model = BaselineTransformer().to(DEVICE)
+    model = BaselineTransformer(vocab_size=11, d_model=128, nhead=4, num_layers=4).to(DEVICE)
+    
     optimizer = optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
     
     loss_history = []
+    best_puzzle_acc = 0.0
     
     for epoch in range(EPOCHS):
         model.train()
@@ -60,13 +63,32 @@ def train():
         avg_loss = total_loss / len(train_loader)
         loss_history.append(avg_loss)
         
-        # Save checkpoint
+        # --- EVALUATION & SAVING ---
+        # Evaluate on Test Set
+        val_cell_acc, val_puzzle_acc = evaluate_model(model, DEVICE, split="test", model_type="standard")
+        
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_loss:.4f}")
+        print(f"  Test Puzzle Acc: {val_puzzle_acc:.2f}% (Cell Acc: {val_cell_acc:.2f}%)")
+        
+        # Save Latest
         torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
-        print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+        
+        # Save Best
+        if val_puzzle_acc > best_puzzle_acc:
+            best_puzzle_acc = val_puzzle_acc
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
+            print(f"  >>> New Best Model Saved! <<<")
+
+        # Save Metrics Log
+        with open(os.path.join(OUTPUT_DIR, "metrics.csv"), "a") as f:
+            if epoch == 0:
+                f.write("Epoch,Loss,CellAcc,PuzzleAcc\n")
+            f.write(f"{epoch+1},{avg_loss},{val_cell_acc},{val_puzzle_acc}\n")
 
     # Plot Convergence
     plot_convergence(loss_history, os.path.join(OUTPUT_DIR, "convergence.png"))
-    print("Training Complete. Model and Graph saved.")
+    print(f"Training Complete. Best Accuracy: {best_puzzle_acc:.2f}%")
 
 if __name__ == "__main__":
     train()
