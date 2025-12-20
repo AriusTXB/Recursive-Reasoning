@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from src.dataset import SudokuDataset
 from src.visualizer import plot_convergence
-from model import SudokuDeepThinking1D
+from model import SudokuDeepThinking2D as SudokuDeepThinkingModel
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -46,7 +46,7 @@ def get_output_for_prog_loss(inputs, max_iters, net):
     return outputs, k
 
 def train():
-    print("--- Training Deep Thinking 1D (Original Paper Implementation) ---")
+    print("--- Training Deep Thinking 2D (Original Paper Implementation) ---")
 
     # Hyperparameters
     BATCH_SIZE = 64
@@ -61,7 +61,7 @@ def train():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     # Model
-    net = SudokuDeepThinking1D(width=196, recall=True, max_iters=MAX_ITERS).to(DEVICE)
+    net = SudokuDeepThinkingModel(width=128, recall=True, max_iters=30).to(DEVICE)
     
     optimizer = optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-4)
     # Using 'none' reduction because the paper's code calculates mean manually after masking

@@ -5,20 +5,26 @@ import torch.nn as nn
 
 # Allow importing from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-from blocks import BasicBlock1D as BasicBlock
+from blocks import BasicBlock2D
 
-class DTNet1D(nn.Module):
-    def __init__(self, block, num_blocks, width, vocab_size=11, recall=True, group_norm=True):
+class DTNet2D(nn.Module):
+    """
+    Core DeepThinking 2D Network.
+    """
+    def __init__(self, block, num_blocks, width, in_channels, vocab_size=11, recall=True, group_norm=True):
         super().__init__()
         self.width = int(width)
         self.recall = recall
         self.group_norm = group_norm
 
-        self.proj_conv = nn.Conv1d(width, width, kernel_size=3, stride=1, padding=1, bias=False)
+        # Project Input Channels -> Hidden Width
+        self.proj_conv = nn.Conv2d(in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
+
+        # Recurrent Layer Input: 
+        # If recall=True: Hidden Width + Original Input Channels
+        recur_in_channels = width + in_channels if self.recall else width
         
-        # If recall, input to recurrent block is width*2
-        in_channels = width * 2 if self.recall else width
-        self.conv_recall = nn.Conv1d(in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_recall = nn.Conv2d(recur_in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
 
         if self.recall:
             recur_layers = [self.conv_recall, nn.ReLU()]
@@ -30,9 +36,10 @@ class DTNet1D(nn.Module):
 
         self.recur_block = nn.Sequential(*recur_layers)
 
-        head_conv1 = nn.Conv1d(width, width, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv2 = nn.Conv1d(width, width // 2, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv3 = nn.Conv1d(width // 2, vocab_size, kernel_size=3, stride=1, padding=1, bias=False)
+        # Heads
+        head_conv1 = nn.Conv2d(width, width, kernel_size=3, stride=1, padding=1, bias=False)
+        head_conv2 = nn.Conv2d(width, width // 2, kernel_size=3, stride=1, padding=1, bias=False)
+        head_conv3 = nn.Conv2d(width // 2, vocab_size, kernel_size=3, stride=1, padding=1, bias=False)
 
         self.projection = nn.Sequential(self.proj_conv, nn.ReLU())
         
@@ -52,52 +59,64 @@ class DTNet1D(nn.Module):
 
     def forward(self, x, iters_to_do, interim_thought=None):
         """
-        x: [Batch, Hidden_Dim, Seq_Len] - The Embedded Input
+        x: [Batch, Channels, 9, 9]
         """
-        # 1. Initialize Thought
         if interim_thought is None:
             interim_thought = self.projection(x)
 
-        # 2. Iterate
+        # Iterate
         for i in range(iters_to_do):
             if self.recall:
-                # Recall mechanism: Concat thought with original input features
+                # Concatenate along channel dimension (dim 1)
                 combined = torch.cat([interim_thought, x], dim=1)
                 interim_thought = self.recur_block(combined)
             else:
                 interim_thought = self.recur_block(interim_thought)
         
-        # 3. Predict (using the state at the last step)
         out = self.head(interim_thought)
-        
-        # Return Tuple to match paper's training logic
         return out, interim_thought
 
 
-class SudokuDeepThinking1D(nn.Module):
-    def __init__(self, vocab_size=11, width=196, recall=True, max_iters=30):
+class SudokuDeepThinking2D(nn.Module):
+    def __init__(self, vocab_size=11, width=128, recall=True, max_iters=30):
         super().__init__()
         self.max_iters = max_iters
         self.embedding = nn.Embedding(vocab_size, width)
-        # Using [2, 2] blocks as per standard DT-1D config
-        self.dt_net = DTNet1D(BasicBlock, num_blocks=[2, 2], width=width, vocab_size=vocab_size, recall=recall)
+        
+        # Note: in_channels is 'width' because we embed the tokens first.
+        # But wait, usually CNNs embed dimensions as channels.
+        # Yes: Embedding(Batch, 81) -> (Batch, 81, Width)
+        # Reshape -> (Batch, Width, 9, 9). So in_channels = Width.
+        
+        self.dt_net = DTNet2D(
+            BasicBlock2D, 
+            num_blocks=[2, 2], 
+            width=width, 
+            in_channels=width, 
+            vocab_size=vocab_size, 
+            recall=recall
+        )
 
     def forward(self, x, iters_to_do=None, interim_thought=None, **kwargs):
         """
-        Wrapper to handle embeddings.
         x: [Batch, 81] indices
         """
         iters = iters_to_do if iters_to_do is not None else self.max_iters
-        
-        # 1. Embed and Transpose to [Batch, Width, 81]
+        batch_size = x.shape[0]
+
+        # 1. Embed: [Batch, 81, Width]
         emb = self.embedding(x)
-        emb = emb.transpose(1, 2)
         
-        # 2. Pass to internal network
-        # Note: We pass 'emb' as 'x' because 'Recall' needs the original features
-        out, final_thought = self.dt_net(emb, iters_to_do=iters, interim_thought=interim_thought)
+        # 2. Reshape to 2D Grid: [Batch, Width, 9, 9]
+        # We need to ensure the 81 length maps correctly to 9x9 row-major
+        emb_grid = emb.permute(0, 2, 1).reshape(batch_size, -1, 9, 9)
         
-        # 3. Transpose output back to [Batch, 81, Vocab] for Loss calculation
-        out = out.permute(0, 2, 1)
+        # 3. Pass to internal network
+        out_grid, final_thought = self.dt_net(emb_grid, iters_to_do=iters, interim_thought=interim_thought)
+        # out_grid: [Batch, Vocab, 9, 9]
         
-        return out, final_thought
+        # 4. Flatten back to [Batch, 81, Vocab]
+        # Reshape [Batch, Vocab, 9, 9] -> [Batch, Vocab, 81] -> [Batch, 81, Vocab]
+        out_flat = out_grid.flatten(2, 3).permute(0, 2, 1)
+        
+        return out_flat, final_thought
