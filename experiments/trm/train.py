@@ -66,7 +66,7 @@ def train():
 
     print(f"Starting Training on {DEVICE}...")
     
-    for epoch in range(5):
+    for epoch in range(100):
         model.train()
         loop = tqdm(loader, desc=f"Epoch {epoch+1}")
         
