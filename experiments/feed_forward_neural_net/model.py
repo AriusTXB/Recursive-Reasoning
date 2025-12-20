@@ -2,133 +2,112 @@ import sys
 import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from random import randrange
 
-# Add root to path to import src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-from blocks import BasicBlock2D
+from src.dataset import SudokuDataset
+from src.visualizer import plot_convergence
+from src.evaluators import evaluate_model
+from model import SudokuFeedForward2D
 
-class FeedForwardNet2D(nn.Module):
-    """
-    Feed-Forward 2D Network.
-    This mimics the DeepThinking process but uses DISTINCT weights for every step.
-    It effectively unrolls the recurrence into a very deep ResNet.
-    """
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    def __init__(self, block, num_blocks, width, in_channels, vocab_size=11, recall=True, max_iters=20, group_norm=True):
-        super().__init__()
+def get_output_for_prog_loss(inputs, max_iters, net):
+    n = randrange(0, max_iters)
+    k = randrange(1, max_iters - n + 1)
 
-        self.width = int(width)
-        self.recall = recall
-        self.group_norm = group_norm
-        self.iters = max_iters
+    if n > 0:
+        with torch.no_grad():
+            _, interim_thought = net(inputs, iters_to_do=n, iters_elapsed=0)
+        interim_thought = interim_thought.detach()
+    else:
+        interim_thought = None
 
-        # 1. Initial Projection
-        self.proj_conv = nn.Conv2d(in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
-        self.projection = nn.Sequential(self.proj_conv, nn.ReLU())
+    outputs, _ = net(inputs, iters_to_do=k, interim_thought=interim_thought, iters_elapsed=n)
+    return outputs, k
 
-        # 2. Recall Layer (Maps [Thought + Input] -> [Hidden])
-        if self.recall:
-            self.recall_layer = nn.Conv2d(width + in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
-        else:
-            self.recall_layer = nn.Identity()
+def train():
+    print(f"--- Training FeedForward 2D on {DEVICE} ---")
+    
+    BATCH_SIZE = 32 
+    MAX_ITERS = 20  
+    ALPHA = 0.5     
+    EPOCHS = 20
+    LR = 0.0005
 
-        # 3. The Layers (Unique parameters for every step 0..max_iters)
-        # We create a ModuleList where index 'i' corresponds to step 'i'
-        self.feedforward_layers = nn.ModuleList()
-        for _ in range(max_iters):
-            self.feedforward_layers.append(self._make_layer_seq(block, width, num_blocks))
+    train_ds = SudokuDataset("data/processed", split="train")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
-        # 4. Heads (Output Projection)
-        head_conv1 = nn.Conv2d(width, width, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv2 = nn.Conv2d(width, width // 2, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv3 = nn.Conv2d(width // 2, vocab_size, kernel_size=3, stride=1, padding=1, bias=False)
+    model = SudokuFeedForward2D(width=128, recall=True, max_iters=MAX_ITERS).to(DEVICE)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    
+    loss_history = []
+    best_puzzle_acc = 0.0
 
-        self.head = nn.Sequential(
-            head_conv1, nn.ReLU(), 
-            head_conv2, nn.ReLU(), 
-            head_conv3
-        )
-
-    def _make_layer_seq(self, block, planes, num_blocks_list):
-        # Helper to build one "Step" (which might contain multiple ResNet blocks)
-        layers = []
-        total_blocks = sum(num_blocks_list) # e.g. [2, 2] -> 4 blocks per step
-        for _ in range(total_blocks):
-            layers.append(block(self.width, planes, stride=1, group_norm=self.group_norm))
-        return nn.Sequential(*layers)
-
-    def forward(self, x, iters_to_do, interim_thought=None, iters_elapsed=0):
-        """
-        x: [Batch, Channels, 9, 9]
-        iters_elapsed: The starting layer index (e.g., if we already ran 5 layers, start at index 5)
-        """
-        # Safety check
-        if iters_elapsed + iters_to_do > self.iters:
-            iters_to_do = self.iters - iters_elapsed
-
-        # Initial Projection (only if starting from scratch)
-        if interim_thought is None:
-            interim_thought = self.projection(x)
-
-        # We don't store all_outputs here to save memory during training, 
-        # unless we specifically wanted to. We just return the final result of this sequence.
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        # Select the specific physical layers we need to run
-        current_layers = self.feedforward_layers[iters_elapsed : iters_elapsed + iters_to_do]
-
-        for i, layer in enumerate(current_layers):
-            if self.recall:
-                # Recall: Concat input 'x' again to refresh memory
-                interim_thought = torch.cat([interim_thought, x], dim=1)
-                interim_thought = self.recall_layer(interim_thought)
+        for inputs, targets in loop:
+            inputs, targets = inputs.to(DEVICE), targets.to(DEVICE).long()
+            targets_flat = targets.view(-1)
             
-            # Apply the UNIQUE layer
-            interim_thought = layer(interim_thought)
+            optimizer.zero_grad()
+
+            # 1. Full Depth Loss
+            outputs_max, _ = model(inputs, iters_to_do=MAX_ITERS, iters_elapsed=0)
+            loss_max = criterion(outputs_max.reshape(-1, 11), targets_flat).mean()
+
+            # 2. Progressive Loss
+            if ALPHA > 0:
+                outputs_prog, k = get_output_for_prog_loss(inputs, MAX_ITERS, model)
+                loss_prog = criterion(outputs_prog.reshape(-1, 11), targets_flat).mean()
+            else:
+                loss_prog = torch.tensor(0.0, device=DEVICE)
+
+            loss = (1 - ALPHA) * loss_max + ALPHA * loss_prog
             
-        # Predict after the last requested layer
-        out = self.head(interim_thought)
-
-        return out, interim_thought
-
-
-class SudokuFeedForward2D(nn.Module):
-    """
-    Wrapper to handle Embedding -> 2D Grid -> Embedding
-    """
-    def __init__(self, vocab_size=11, width=128, recall=True, max_iters=20):
-        super().__init__()
-        self.max_iters = max_iters
-        self.embedding = nn.Embedding(vocab_size, width)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            total_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+            
+        avg_loss = total_loss / len(train_loader)
+        loss_history.append(avg_loss)
         
-        # Input channels is 'width' because we embed first
-        self.ff_net = FeedForwardNet2D(
-            BasicBlock2D, 
-            num_blocks=[2, 2], 
-            width=width, 
-            in_channels=width, 
-            vocab_size=vocab_size, 
-            recall=recall,
-            max_iters=max_iters
-        )
+        # --- EVALUATION & SAVING ---
+        # The FeedForward forward() returns (out, thought), similar to DeepThinking
+        # evaluator.py handles tuple returns for "standard" types automatically, 
+        # or we can pass "standard" (default). 
+        val_cell_acc, val_puzzle_acc = evaluate_model(model, DEVICE, split="test", model_type="standard")
+        
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_loss:.4f}")
+        print(f"  Test Puzzle Acc: {val_puzzle_acc:.2f}% (Cell Acc: {val_cell_acc:.2f}%)")
+        
+        torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
+        
+        if val_puzzle_acc > best_puzzle_acc:
+            best_puzzle_acc = val_puzzle_acc
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
+            print(f"  >>> New Best Model Saved! <<<")
 
-    def forward(self, x, iters_to_do=None, interim_thought=None, iters_elapsed=0, **kwargs):
-        iters = iters_to_do if iters_to_do is not None else self.max_iters
-        batch_size = x.shape[0]
+        with open(os.path.join(OUTPUT_DIR, "metrics.csv"), "a") as f:
+            if epoch == 0: f.write("Epoch,Loss,CellAcc,PuzzleAcc\n")
+            f.write(f"{epoch+1},{avg_loss},{val_cell_acc},{val_puzzle_acc}\n")
 
-        # 1. Embed & Reshape to 2D
-        emb = self.embedding(x) # [B, 81, W]
-        # Permute to [B, W, 81] then reshape to [B, W, 9, 9]
-        emb_grid = emb.permute(0, 2, 1).reshape(batch_size, -1, 9, 9)
-        
-        # 2. Forward pass through the FeedForward Net
-        out_grid, final_thought = self.ff_net(
-            emb_grid, 
-            iters_to_do=iters, 
-            interim_thought=interim_thought, 
-            iters_elapsed=iters_elapsed
-        )
-        
-        # 3. Flatten Output: [B, Vocab, 9, 9] -> [B, 81, Vocab]
-        out_flat = out_grid.flatten(2, 3).permute(0, 2, 1)
-        
-        return out_flat, final_thought
+    plot_convergence(loss_history, os.path.join(OUTPUT_DIR, "convergence.png"))
+    print(f"Training Complete. Best Accuracy: {best_puzzle_acc:.2f}%")
+
+if __name__ == "__main__":
+    train()

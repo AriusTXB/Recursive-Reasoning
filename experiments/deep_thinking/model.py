@@ -2,121 +2,115 @@ import sys
 import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from random import randrange
 
-# Allow importing from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-from blocks import BasicBlock2D
+from src.dataset import SudokuDataset
+from src.visualizer import plot_convergence
+from src.evaluators import evaluate_model
+from model import SudokuDeepThinking2D
 
-class DTNet2D(nn.Module):
-    """
-    Core DeepThinking 2D Network.
-    """
-    def __init__(self, block, num_blocks, width, in_channels, vocab_size=11, recall=True, group_norm=True):
-        super().__init__()
-        self.width = int(width)
-        self.recall = recall
-        self.group_norm = group_norm
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        # Project Input Channels -> Hidden Width
-        self.proj_conv = nn.Conv2d(in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
+def get_output_for_prog_loss(inputs, max_iters, net):
+    n = randrange(0, max_iters)
+    k = randrange(1, max_iters - n + 1)
 
-        # Recurrent Layer Input: 
-        # If recall=True: Hidden Width + Original Input Channels
-        recur_in_channels = width + in_channels if self.recall else width
+    if n > 0:
+        with torch.no_grad():
+            _, interim_thought = net(inputs, iters_to_do=n)
+        interim_thought = interim_thought.detach()
+    else:
+        interim_thought = None
+
+    outputs, _ = net(inputs, iters_to_do=k, interim_thought=interim_thought)
+    return outputs, k
+
+def train():
+    print(f"--- Training Deep Thinking 2D on {DEVICE} ---")
+
+    BATCH_SIZE = 64
+    MAX_ITERS = 30
+    ALPHA = 0.5
+    LR = 0.0005
+    EPOCHS = 20
+    CLIP = 1.0
+
+    train_ds = SudokuDataset("data/processed", split="train")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+
+    model = SudokuDeepThinking2D(width=128, recall=True, max_iters=MAX_ITERS).to(DEVICE)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(reduction="none") 
+    
+    loss_history = []
+    best_puzzle_acc = 0.0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
         
-        self.conv_recall = nn.Conv2d(recur_in_channels, width, kernel_size=3, stride=1, padding=1, bias=False)
-
-        if self.recall:
-            recur_layers = [self.conv_recall, nn.ReLU()]
-        else:
-            recur_layers = []
-
-        for i in range(len(num_blocks)):
-            recur_layers.append(self._make_layer(block, width, num_blocks[i], stride=1))
-
-        self.recur_block = nn.Sequential(*recur_layers)
-
-        # Heads
-        head_conv1 = nn.Conv2d(width, width, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv2 = nn.Conv2d(width, width // 2, kernel_size=3, stride=1, padding=1, bias=False)
-        head_conv3 = nn.Conv2d(width // 2, vocab_size, kernel_size=3, stride=1, padding=1, bias=False)
-
-        self.projection = nn.Sequential(self.proj_conv, nn.ReLU())
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        self.head = nn.Sequential(
-            head_conv1, nn.ReLU(),
-            head_conv2, nn.ReLU(),
-            head_conv3
-        )
+        for inputs, targets in loop:
+            inputs, targets = inputs.to(DEVICE), targets.to(DEVICE).long()
+            targets_flat = targets.view(-1)
 
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for strd in strides:
-            layers.append(block(self.width, planes, strd, self.group_norm))
-            self.width = planes * block.expansion
-        return nn.Sequential(*layers)
+            optimizer.zero_grad()
 
-    def forward(self, x, iters_to_do, interim_thought=None):
-        """
-        x: [Batch, Channels, 9, 9]
-        """
-        if interim_thought is None:
-            interim_thought = self.projection(x)
+            # 1. Max Iters Loss
+            outputs_max, _ = model(inputs, iters_to_do=MAX_ITERS)
+            loss_max = criterion(outputs_max.reshape(-1, 11), targets_flat).mean()
 
-        # Iterate
-        for i in range(iters_to_do):
-            if self.recall:
-                # Concatenate along channel dimension (dim 1)
-                combined = torch.cat([interim_thought, x], dim=1)
-                interim_thought = self.recur_block(combined)
+            # 2. Progressive Loss
+            if ALPHA > 0:
+                outputs_prog, k = get_output_for_prog_loss(inputs, MAX_ITERS, model)
+                loss_prog = criterion(outputs_prog.reshape(-1, 11), targets_flat).mean()
             else:
-                interim_thought = self.recur_block(interim_thought)
-        
-        out = self.head(interim_thought)
-        return out, interim_thought
+                loss_prog = torch.tensor(0.0, device=DEVICE)
 
+            loss = (1 - ALPHA) * loss_max + ALPHA * loss_prog
+            
+            loss.backward()
+            if CLIP:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+            optimizer.step()
 
-class SudokuDeepThinking2D(nn.Module):
-    def __init__(self, vocab_size=11, width=128, recall=True, max_iters=30):
-        super().__init__()
-        self.max_iters = max_iters
-        self.embedding = nn.Embedding(vocab_size, width)
+            total_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
         
-        # Note: in_channels is 'width' because we embed the tokens first.
-        # But wait, usually CNNs embed dimensions as channels.
-        # Yes: Embedding(Batch, 81) -> (Batch, 81, Width)
-        # Reshape -> (Batch, Width, 9, 9). So in_channels = Width.
+        avg_loss = total_loss / len(train_loader)
+        loss_history.append(avg_loss)
         
-        self.dt_net = DTNet2D(
-            BasicBlock2D, 
-            num_blocks=[2, 2], 
-            width=width, 
-            in_channels=width, 
-            vocab_size=vocab_size, 
-            recall=recall
-        )
+        # --- EVALUATION & SAVING ---
+        # Note: model_type="deep_thinking" ensures the evaluator handles the tuple return correctly
+        val_cell_acc, val_puzzle_acc = evaluate_model(model, DEVICE, split="test", model_type="deep_thinking")
+        
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_loss:.4f}")
+        print(f"  Test Puzzle Acc: {val_puzzle_acc:.2f}% (Cell Acc: {val_cell_acc:.2f}%)")
+        
+        # Save Latest
+        torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
+        
+        # Save Best
+        if val_puzzle_acc > best_puzzle_acc:
+            best_puzzle_acc = val_puzzle_acc
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
+            print(f"  >>> New Best Model Saved! <<<")
 
-    def forward(self, x, iters_to_do=None, interim_thought=None, **kwargs):
-        """
-        x: [Batch, 81] indices
-        """
-        iters = iters_to_do if iters_to_do is not None else self.max_iters
-        batch_size = x.shape[0]
+        with open(os.path.join(OUTPUT_DIR, "metrics.csv"), "a") as f:
+            if epoch == 0: f.write("Epoch,Loss,CellAcc,PuzzleAcc\n")
+            f.write(f"{epoch+1},{avg_loss},{val_cell_acc},{val_puzzle_acc}\n")
 
-        # 1. Embed: [Batch, 81, Width]
-        emb = self.embedding(x)
-        
-        # 2. Reshape to 2D Grid: [Batch, Width, 9, 9]
-        # We need to ensure the 81 length maps correctly to 9x9 row-major
-        emb_grid = emb.permute(0, 2, 1).reshape(batch_size, -1, 9, 9)
-        
-        # 3. Pass to internal network
-        out_grid, final_thought = self.dt_net(emb_grid, iters_to_do=iters, interim_thought=interim_thought)
-        # out_grid: [Batch, Vocab, 9, 9]
-        
-        # 4. Flatten back to [Batch, 81, Vocab]
-        # Reshape [Batch, Vocab, 9, 9] -> [Batch, Vocab, 81] -> [Batch, 81, Vocab]
-        out_flat = out_grid.flatten(2, 3).permute(0, 2, 1)
-        
-        return out_flat, final_thought
+    plot_convergence(loss_history, os.path.join(OUTPUT_DIR, "convergence.png"))
+    print(f"Training Complete. Best Accuracy: {best_puzzle_acc:.2f}%")
+
+if __name__ == "__main__":
+    train()
