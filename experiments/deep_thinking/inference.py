@@ -7,7 +7,7 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from src.dataset import SudokuDataset
 from src.visualizer import draw_board, create_gif
-from model import SudokuDeepThinking1D
+from model import SudokuDeepThinking2D
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -15,7 +15,7 @@ SAMPLE_DIR = os.path.join(OUTPUT_DIR, "thought_process")
 
 def run_visual_inference():
     # Load Model
-    model = SudokuDeepThinking1D(width=196, recall=True, max_iters=30).to(DEVICE)
+    model = SudokuDeepThinking2D(width=196, recall=True, max_iters=30).to(DEVICE)
     model_path = os.path.join(OUTPUT_DIR, "model_dt1d.pt")
     
     if not os.path.exists(model_path):
