@@ -7,3 +7,5 @@ argdantic
 huggingface_hub
 imageio
 scikit-learn
+pandas
+seaborn
