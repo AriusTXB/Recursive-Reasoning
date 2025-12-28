@@ -12,10 +12,10 @@ echo ">>> Setting up environment..."
 # Ensure packages exist so python imports work
 touch experiments/__init__.py
 touch experiments/baseline_transformer/__init__.py
-touch experiments/deep_thinking_2d/__init__.py
-touch experiments/feedforward_2d/__init__.py
+touch experiments/deep_thinking/__init__.py
+touch experiments/feed_forward_neural_net/__init__.py
 touch experiments/trm/__init__.py
-touch experiments/neural_operator/__init__.py
+touch experiments/neural_operators/__init__.py
 
 # -----------------------------------------------------------------
 # 1. DATA PREPROCESSING
