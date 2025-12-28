@@ -47,13 +47,13 @@ echo ">> 2. TRM (Tiny Recursive Model)..."
 python experiments/trm/train.py
 
 echo ">> 3. Deep Thinking 2D..."
-python experiments/deep_thinking_2d/train.py
+python experiments/deep_thinking/train.py
 
 echo ">> 4. FeedForward 2D..."
-python experiments/feedforward_2d/train.py
+python experiments/feed_forward_neural_net/train.py
 
 echo ">> 5. Neural Operator..."
-python experiments/neural_operator/train.py
+python experiments/neural_operators/train.py
 
 # -----------------------------------------------------------------
 # 3. VISUALIZATION (GIFs)
