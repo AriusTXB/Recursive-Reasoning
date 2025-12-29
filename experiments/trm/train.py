@@ -4,11 +4,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 import copy
-import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from src.dataset import SudokuDataset
@@ -18,23 +17,33 @@ from model import TinyRecursiveReasoningModel_ACTV1
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-EPOCH = 100
-# --- LARGE CONFIGURATION ---
+
+# --- LARGE MODEL CONFIGURATION ---
 CONFIG = {
-    "batch_size": 32, # Lower batch size for large model
-    "seq_len": 81, "vocab_size": 11, "puzzle_emb_ndim": 0, "num_puzzle_identifiers": 1,
+    "batch_size": 32, # Safe batch size
+    "seq_len": 81, "vocab_size": 11,
+    "puzzle_emb_ndim": 0, "num_puzzle_identifiers": 1,
+    
+    # Recurrence Args
     "H_cycles": 1, "L_cycles": 2, "H_layers": 0, "L_layers": 2,
     
-    # SCALED PARAMS
+    # Large Dimensions (~10M Params)
     "hidden_size": 768, 
     "expansion": 4.0, 
     "num_heads": 12,
     
-    "pos_encodings": "rope", "forward_dtype": "float32", "puzzle_emb_len": 0,
-    "halt_max_steps": 20, "halt_exploration_prob": 0.0,
+    "pos_encodings": "rope", "forward_dtype": "float32",
+    "puzzle_emb_len": 0, # Fixes size mismatch error
     
-    "total_steps": 10000, "lr": 0.0005, "eval_interval": 500, "log_interval": 50, "ema_rate": 0.995
+    "halt_max_steps": 20,
+    "halt_exploration_prob": 0.0 # Controlled via Curriculum
 }
+
+# Training Hyperparams
+LR = 5e-5          # Critical Fix: Lower LR for large recurrent model
+WEIGHT_DECAY = 1e-2
+EPOCHS = 100
+GRAD_CLIP = 1.0
 
 class EMAHelper:
     def __init__(self, model, decay=0.999):
@@ -54,117 +63,118 @@ class EMAHelper:
             if param.requires_grad: param.data.copy_(self.shadow[name])
         return ema
 
-class SudokuStream(IterableDataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.indices = np.arange(len(dataset))
-    def __iter__(self):
-        while True:
-            np.random.shuffle(self.indices)
-            for idx in self.indices: yield self.dataset[idx]
-
 def train():
-    print(f"--- Training LARGE TRM on {DEVICE} ---")
+    print(f"--- Training LARGE TRM (Stabilized) on {DEVICE} ---")
     
-    train_ds_raw = SudokuDataset("data/processed", "train")
-    stream_ds = SudokuStream(train_ds_raw)
-    loader = DataLoader(stream_ds, batch_size=CONFIG["batch_size"])
-    iterator = iter(loader)
+    # 1. Data
+    train_ds = SudokuDataset("data/processed", "train")
+    # Drop_last=True helps with shape consistency
+    loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"], shuffle=True, drop_last=True, num_workers=2)
 
+    # 2. Model
     model = TinyRecursiveReasoningModel_ACTV1(CONFIG).to(DEVICE)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"], weight_decay=1e-4)
+    # 3. Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     criterion_ce = nn.CrossEntropyLoss()
-    ema = EMAHelper(model, decay=CONFIG["ema_rate"])
-
-    # Init State
-    init_x, init_y = next(iterator)
-    init_batch = {
-        "inputs": init_x.to(DEVICE), "labels": init_y.to(DEVICE),
-        "puzzle_identifiers": torch.zeros(CONFIG["batch_size"], dtype=torch.int32).to(DEVICE)
-    }
-    carry = model.initial_carry(init_batch)
+    ema = EMAHelper(model, decay=0.995)
     
-    best_puzzle_acc = -1.0
-    best_cell_acc = -1.0
+    best_acc = -1.0
     
-    model.train()
-    prev_z_L = None
-
-    for step in range(1, CONFIG["total_steps"] + 1):
-        force_prob = max(0.0, 1.0 - (step / (0.8 * CONFIG["total_steps"])))
+    for epoch in range(EPOCHS):
+        model.train()
+        
+        # --- Curriculum: Decay Force Prob ---
+        # Epoch 0 -> 100% Forced. Epoch 10 -> 0% Forced.
+        force_prob = max(0.0, 1.0 - (epoch / (0.7 * EPOCHS)))
         model.config.halt_exploration_prob = force_prob
         
-        try: next_x, next_y = next(iterator)
-        except: iterator = iter(loader); next_x, next_y = next(iterator)
+        total_loss = 0
+        avg_steps = 0
         
-        batch_data = {
-            "inputs": next_x.to(DEVICE), "labels": next_y.to(DEVICE),
-            "puzzle_identifiers": torch.zeros(CONFIG["batch_size"], dtype=torch.int32).to(DEVICE)
-        }
-
-        if not carry.halted.all(): prev_z_L = carry.inner_carry.z_L.clone().detach()
-        else: prev_z_L = None
-
-        carry, outputs = model(carry, batch_data)
-
-        logits = outputs["logits"]
-        targets = carry.current_data["labels"]
-        loss_ce = criterion_ce(logits.view(-1, 11), targets.view(-1))
+        loop = tqdm(loader, desc=f"Ep {epoch+1} (Force {force_prob:.2f})")
         
-        preds = torch.argmax(logits, dim=-1)
-        is_correct = (preds == targets).all(dim=1).float()
-        reward = torch.where(is_correct == 1.0, torch.tensor(1.0, device=DEVICE), torch.tensor(-1.0, device=DEVICE))
-        loss_q = F.mse_loss(outputs["q_halt"], reward)
-        
-        loss_stag = torch.tensor(0.0, device=DEVICE)
-        if prev_z_L is not None:
-            curr_z_L = carry.inner_carry.z_L
-            valid = ~carry.halted
-            if valid.any():
-                loss_stag = F.cosine_similarity(prev_z_L[valid].flatten(1), curr_z_L[valid].flatten(1)).mean()
-
-        total_loss = loss_ce + 0.1 * loss_q + 0.1 * loss_stag
-
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        ema.update(model)
-        
-        carry.inner_carry.z_L = carry.inner_carry.z_L.detach()
-
-        if step % CONFIG["log_interval"] == 0:
-            print(f"Step {step} | Loss: {total_loss.item():.4f} | Force%: {force_prob:.2f}")
-
-        # --- EVALUATION ---
-        if step % CONFIG["eval_interval"] == 0 or step == CONFIG["total_steps"]:
-            print(">>> Evaluating...")
-            test_model = ema.apply_shadow(model)
+        for inputs, labels in loop:
+            # Unpack and Dictionary Setup
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            batch_data = {
+                "inputs": inputs, 
+                "labels": labels,
+                "puzzle_identifiers": torch.zeros(CONFIG["batch_size"], dtype=torch.int32).to(DEVICE)
+            }
             
-            class EvalWrapper(nn.Module):
-                def __init__(self, inner): super().__init__(); self.inner = inner
-                def forward(self, x):
-                    B = x.shape[0]
-                    b = {"inputs": x, "labels": torch.zeros_like(x), "puzzle_identifiers": torch.zeros(B, dtype=torch.int32).to(x.device)}
-                    c = self.inner.initial_carry(b); c.halted[:] = False
-                    f = None
-                    for _ in range(EPOCH): c, o = self.inner(c, b); f = o["logits"]
-                    return f, None
+            # Init State
+            carry = model.initial_carry(batch_data)
+            
+            # Save state for Stagnation Check
+            prev_z_L = None
+            
+            # Forward
+            # We must handle the carry carefully. 
+            # In epoch-based training, we reset carry every batch, so no need to detach 'prev' carry.
+            
+            # Run Forward
+            carry, outputs = model(carry, batch_data)
+            
+            # Loss 1: CE
+            logits = outputs["logits"]
+            # Important: Use labels from batch, not carry (carry labels might be masked/swapped)
+            loss_ce = criterion_ce(logits.view(-1, 11), labels.view(-1))
+            
+            # Loss 2: Q-Learning
+            preds = torch.argmax(logits, dim=-1)
+            is_correct = (preds == labels).all(dim=1).float()
+            # Strong Reward signal
+            reward = torch.where(is_correct == 1.0, torch.tensor(1.0, device=DEVICE), torch.tensor(-1.0, device=DEVICE))
+            loss_q = F.mse_loss(outputs["q_halt"], reward)
+            
+            # Loss 3: Stagnation (Optional but helpful)
+            # We can't easily calc stagnation here because we didn't keep prev_z_L from inside the loop
+            # The model internal loop handles recurrence.
+            # We rely on Q-loss and CE-loss here.
+            
+            loss = loss_ce + 0.1 * loss_q
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            ema.update(model)
+            
+            total_loss += loss.item()
+            current_steps = carry.steps.float().mean().item()
+            avg_steps += current_steps
+            
+            loop.set_postfix(loss=loss.item(), steps=current_steps)
+            
+        # --- End of Epoch Eval ---
+        print(f"  Avg Loss: {total_loss/len(loader):.4f} | Avg Steps: {avg_steps/len(loader):.2f}")
+        
+        # Evaluate
+        test_model = ema.apply_shadow(model)
+        
+        # Eval Wrapper
+        class EvalWrapper(nn.Module):
+            def __init__(self, inner): super().__init__(); self.inner = inner
+            def forward(self, x):
+                B = x.shape[0]
+                b = {"inputs": x, "labels": torch.zeros_like(x), "puzzle_identifiers": torch.zeros(B, dtype=torch.int32).to(x.device)}
+                c = self.inner.initial_carry(b); c.halted[:] = False
+                f = None
+                for _ in range(20): c, o = self.inner(c, b); f = o["logits"]
+                return f, None
 
-            wrapped = EvalWrapper(test_model)
-            val_cell_acc, val_puzzle_acc = evaluate_model(wrapped, DEVICE, split="test", model_type="deep_thinking")
-            print(f"  Result: P:{val_puzzle_acc:.2f}% C:{val_cell_acc:.2f}%")
-            
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
-            
-            # Smart Save logic
-            if val_puzzle_acc > best_puzzle_acc or (val_puzzle_acc == best_puzzle_acc and val_cell_acc > best_cell_acc):
-                best_puzzle_acc = val_puzzle_acc
-                best_cell_acc = val_cell_acc
-                torch.save(test_model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
-                print(">>> New Best Model Saved!")
+        wrapped = EvalWrapper(test_model)
+        val_cell, val_puzzle = evaluate_model(wrapped, DEVICE, split="test", model_type="deep_thinking")
+        
+        print(f"  Test Puzzle Acc: {val_puzzle:.2f}% | Cell Acc: {val_cell:.2f}%")
+        
+        torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_latest.pt"))
+        if val_puzzle > best_acc:
+            best_acc = val_puzzle
+            torch.save(test_model.state_dict(), os.path.join(OUTPUT_DIR, "model_best.pt"))
+            print("  >>> New Best Model Saved!")
 
 if __name__ == "__main__":
     train()
