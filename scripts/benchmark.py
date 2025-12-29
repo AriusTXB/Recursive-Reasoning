@@ -122,13 +122,13 @@ def main():
     # 2. Deep Thinking 2D
     # Scaled: width=384
     m2 = SudokuDeepThinking2D(width=384, recall=True, max_iters=30)
-    res2 = bench("Deep Thinking", m2, "experiments/deep_thinking_2d/output/model_best.pt", "deep_thinking")
+    res2 = bench("Deep Thinking", m2, "experiments/deep_thinking/output/model_best.pt", "deep_thinking")
     if res2: results.append(res2)
     
     # 3. FeedForward 2D
     # Scaled: width=192, layers=12
     m3 = SudokuFeedForward2D(width=192, recall=True, max_iters=12)
-    res3 = bench("FeedForward", m3, "experiments/feedforward_2d/output/model_best.pt", "standard")
+    res3 = bench("FeedForward", m3, "experiments/feed_forward_neural_net/output/model_best.pt", "standard")
     if res3: results.append(res3)
 
     # 4. TRM (Tiny Recursive Model)
@@ -150,7 +150,7 @@ def main():
     # Scaled config: hidden_dim=384, depth=4
     nop_inner = NeuralOperatorSolver(vocab_size=11, hidden_dim=384, depth=4)
     m5 = NeuralOpEvalWrapper(nop_inner)
-    res5 = bench("Neural Operator", m5, "experiments/neural_operator/output/model_nop.pt", "standard")
+    res5 = bench("Neural Operator", m5, "experiments/neural_operators/output/model_nop.pt", "standard")
     if res5: results.append(res5)
 
     # --- Plotting ---
