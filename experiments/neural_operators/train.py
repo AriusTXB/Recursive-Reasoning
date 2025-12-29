@@ -27,7 +27,7 @@ def train():
     
     # Scaled Config (~12M params)
     BATCH_SIZE = 64
-    EPOCHS = 100
+    EPOCHS = 50
     HIDDEN_DIM = 384
     DEPTH = 4
     

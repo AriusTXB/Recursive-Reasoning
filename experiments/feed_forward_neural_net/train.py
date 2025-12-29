@@ -34,7 +34,7 @@ def train():
     BATCH_SIZE = 24
     MAX_ITERS = 12
     WIDTH = 192 
-    EPOCH = 100
+    EPOCH = 50
     train_ds = SudokuDataset("data/processed", split="train")
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 

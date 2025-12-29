@@ -21,7 +21,7 @@ def train():
     
     # 1. Config (Scaled to ~11M Params)
     BATCH_SIZE = 64
-    EPOCHS = 100
+    EPOCHS = 50
     LR = 0.0005
     
     # Large Architecture

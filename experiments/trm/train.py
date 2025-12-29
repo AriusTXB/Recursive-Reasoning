@@ -42,7 +42,7 @@ CONFIG = {
 # Training Hyperparams
 LR = 5e-5          # Critical Fix: Lower LR for large recurrent model
 WEIGHT_DECAY = 1e-2
-EPOCHS = 100
+EPOCHS = 15
 GRAD_CLIP = 1.0
 
 class EMAHelper:
